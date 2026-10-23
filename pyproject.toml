@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bytecheck"
+dynamic = ["version"]
+description = "Byte-exact verification of what an agent changed. Snapshot before, verify after."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+dependencies = []
+keywords = ["agents", "llm", "verification", "sha256", "diff", "ci"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+bytecheck = "bytecheck:main"
+
+[project.urls]
+Homepage = "https://github.com/vasyapym/bytecheck"
+Changelog = "https://github.com/vasyapym/bytecheck/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+py-modules = ["bytecheck"]
+
+[tool.setuptools.dynamic]
+version = { attr = "bytecheck.__version__" }

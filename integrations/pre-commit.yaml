@@ -1,0 +1,9 @@
+# Content rules on every staged text file. Add to .pre-commit-config.yaml.
+repos:
+  - repo: local
+    hooks:
+      - id: bytecheck-scan
+        name: bytecheck scan
+        entry: python3 bytecheck.py scan --strict
+        language: system
+        types: [text]

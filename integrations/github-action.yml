@@ -1,0 +1,25 @@
+# Verify a pull request against its base branch with a committed policy.
+# Drop into .github/workflows/. Needs .bytecheck/policy.json in the repo.
+name: bytecheck
+
+on:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+          path: .base
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: fetch bytecheck and verify the verifier
+        run: |
+          curl -fsSLO https://raw.githubusercontent.com/vasyapym/bytecheck/v0.1.0/bytecheck.py
+          python bytecheck.py hash bytecheck.py --expect "${{ vars.BYTECHECK_SHA256 }}"
+      - name: verify PR tree against base
+        run: python bytecheck.py verify --baseline .base --policy .bytecheck/policy.json --exclude '.base/' --exclude 'bytecheck.py'

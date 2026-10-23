@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        exclude:
+          # setup-python has no arm64 macOS builds for these
+          - { os: macos-latest, python: "3.8" }
+          - { os: macos-latest, python: "3.9" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: unit tests
+        shell: bash
+        run: |
+          if [ -d tests ]; then
+            python -m unittest discover -s tests -v
+          else
+            echo "no tests/ directory yet; skipping"
+          fi
+      - name: dogfood, content rules on the repository itself
+        run: python bytecheck.py scan . --strict --exclude 'tests/fixtures/'
+      - name: dogfood, untouched tree verifies clean
+        shell: bash
+        run: |
+          python bytecheck.py snapshot . -o "$RUNNER_TEMP/m.json" --store
+          python bytecheck.py verify "$RUNNER_TEMP/m.json" --json --quiet
+      - name: dogfood, tree hash is identical across platforms
+        shell: bash
+        run: python bytecheck.py hash bytecheck.py
