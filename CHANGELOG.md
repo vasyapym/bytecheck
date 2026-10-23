@@ -3,6 +3,13 @@
 Semantic versioning for the tool. The manifest `format` integer bumps only on breaking
 schema changes; `verify` refuses manifests newer than it understands.
 
+## Unreleased
+
+- Capture: `opencode-capture.ts`, an opencode plugin shipped with the skill. Every
+  user message lands in the project's `.bytecheck/inbox/` as a byte-exact file with
+  a `.sha256` sidecar; `SKILL.md` documents install and the harvest protocol.
+  `bytecheck.py` is unchanged.
+
 ## 0.1.0 - 2026-10-23
 
 First release.

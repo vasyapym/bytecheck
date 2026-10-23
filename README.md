@@ -53,7 +53,20 @@ python3 bytecheck.py hash bytecheck.py --expect d8966c6f8e48890035d76e5c58c7ae5c
 
 Not on PyPI yet. When it is, the distribution will be `bytecheck-cli`; the module and the command stay `bytecheck`.
 
-For agents, the repository root is an Agent Skill. Copy `SKILL.md` and `bytecheck.py` into a skills directory such as `.claude/skills/bytecheck/`. `SKILL.md` carries the protocol; `bytecheck.py` sits beside it. See [For agents](#for-agents).
+For agents, the repository root is an Agent Skill. Copy `SKILL.md`, `bytecheck.py` and — for opencode — `opencode-capture.ts` into a skills directory such as `.claude/skills/bytecheck/`. `SKILL.md` carries the protocol; `bytecheck.py` sits beside it. See [For agents](#for-agents).
+
+## Paste capture (opencode)
+
+`opencode-capture.ts` ships with the skill: an opencode plugin that writes every
+message the human types or pastes into the chat to `.bytecheck/inbox/` in the
+project — one UTF-8 file per text part, a `.sha256` sidecar beside it. Byte-exact:
+the file is the received text and nothing else, no normalisation. Copy it into
+`~/.config/opencode/plugins/` and restart opencode; plugins load at startup only.
+
+Why: a reply that exists only in chat context cannot be verified — an agent asked
+to reproduce it produces a paraphrase, placeholders included. Once the paste is a
+file, the harvest protocol in `SKILL.md` applies: hash the capture, read from the
+file, place it with `same`, and never re-type received content.
 
 ## Commands
 

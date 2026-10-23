@@ -2,6 +2,10 @@
 
 Keep it one file. Keep it stdlib. Keep Python 3.8.
 
+That is `bytecheck.py`. The opencode capture plugin (`opencode-capture.ts`) ships
+beside the skill, not inside the package: TypeScript, node builtins only, no runtime
+dependencies, no bytecheck.py changes just to capture.
+
 A change to `bytecheck.py` needs a test in `tests/`. A new rule needs one positive and one
 negative fixture, and a line in README and SKILL.md. A new flag needs a reason the existing
 six commands and fifteen-odd rules cannot cover.
