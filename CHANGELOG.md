@@ -3,7 +3,7 @@
 Semantic versioning for the tool. The manifest `format` integer bumps only on breaking
 schema changes; `verify` refuses manifests newer than it understands.
 
-## 0.1.0 - unreleased
+## 0.1.0 - 2026-10-23
 
 First release.
 

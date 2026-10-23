@@ -48,10 +48,12 @@ Copy one file. Check it.
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/vasyapym/bytecheck/v0.1.0/bytecheck.py
-python3 bytecheck.py hash bytecheck.py --expect <sha256 from the release page>
+python3 bytecheck.py hash bytecheck.py --expect d8966c6f8e48890035d76e5c58c7ae5c845c06fc87bd4095066581cacbb7bab6
 ```
 
-Or, for humans: `pipx run bytecheck` / `uvx bytecheck`.
+Or, for humans, once the PyPI publish lands: `pipx install bytecheck-cli` (the PyPI name
+`bytecheck` is taken, so the distribution publishes as `bytecheck-cli`; the module and
+command stay `bytecheck`).
 
 For agents: the repository root is a skill. Copy it to `.claude/skills/bytecheck/` or any Agent Skills compatible directory. `SKILL.md` carries the protocol; `bytecheck.py` sits beside it. See [For agents](#for-agents).
 

@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bytecheck"
+name = "bytecheck-cli"
 dynamic = ["version"]
 description = "Byte-exact verification of what an agent changed. Snapshot before, verify after."
 readme = "README.md"
