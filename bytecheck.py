@@ -22,7 +22,7 @@ import stat
 import sys
 import unicodedata
 from datetime import datetime, timezone
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 # ----------------------------------------------------------------------------
 # constants
 # ----------------------------------------------------------------------------
@@ -52,10 +52,12 @@ RULES = {
     "bidi-control": ("error", "absolute"),
     "bom-changed": ("error", "delta"),
     "eol-changed": ("error", "delta"),
+    "utf8-lost": ("error", "delta"),
     "zero-width": ("warn", "absolute"),
     "smart-quote": ("warn", "absolute"),
     "nbsp": ("warn", "absolute"),
     "mixed-eol": ("warn", "absolute"),
+    "mixed-script": ("warn", "absolute"),
     "shrunk": ("warn", "delta"),
     "trailing-newline-lost": ("warn", "delta"),
     "indent-flipped": ("warn", "delta"),
@@ -108,6 +110,27 @@ def write_file(path, data):
         os.makedirs(parent, exist_ok=True)
     with open(path, "wb") as f:
         f.write(data)
+def write_atomic(path, data):
+    """Write via <path>.tmp-<pid> then rename, creating parents like write_file does for manifests."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%d %s" if unit == "B" else "%.1f %s") % (n, unit)
+        n /= 1024.0
 # ----------------------------------------------------------------------------
 # paths and globs
 # ----------------------------------------------------------------------------
@@ -463,6 +486,101 @@ def format_hunk(h):
     else:
         old = "%d-%d" % (h["old_start"], h["old_end"])
     return "old %s (+%d -%d)" % (old, h["added"], h["removed"])
+# ----------------------------------------------------------------------------
+# patch renderers (--format unified|md)
+# ----------------------------------------------------------------------------
+def git_mode(entry):
+    if not entry:
+        return None
+    if entry.get("type") == "symlink":
+        return "120000"
+    return "100755" if entry.get("exec") else "100644"
+def patch_lines(data):
+    """Split on LF only (a CR stays inside its line); surrogateescape makes re-encoding byte-exact."""
+    parts = data.split(b"\n")
+    tail = parts.pop()
+    lines = [p + b"\n" for p in parts] + ([tail] if tail else [])
+    return [l.decode("utf-8", "surrogateescape") for l in lines]
+def unified_body(before, after, src, dst):
+    a, b = patch_lines(before), patch_lines(after)
+    if len(before) > HUNK_MAX_BYTES or len(after) > HUNK_MAX_BYTES:
+        diff = ["--- " + src, "+++ " + dst,
+                "@@ -%s +%s @@" % ("1,%d" % len(a) if a else "0,0", "1,%d" % len(b) if b else "0,0")]
+        diff += ["-" + l for l in a] + ["+" + l for l in b]
+    else:
+        diff = difflib.unified_diff(a, b, src, dst, n=3, lineterm="")
+    out = []
+    for i, line in enumerate(diff):
+        if i < 2 or line.startswith("@@ "):
+            out.append(line + "\n")
+        elif line.endswith("\n"):
+            out.append(line)
+        else:
+            out.append(line + "\n\\ No newline at end of file\n")
+    return out
+def git_section(sec):
+    """One git-style section (header, mode/rename lines, hunks or the binary line) as LF-terminated text lines."""
+    kind, path = sec["kind"], sec["path"]
+    old = sec.get("old_path") or path
+    before, after = sec.get("before", b""), sec.get("after", b"")
+    om, nm = sec.get("old_mode"), sec.get("new_mode")
+    lines = ["diff --git a/%s b/%s\n" % (old, path)]
+    if kind == "added":
+        lines.append("new file mode %s\n" % (nm or "100644"))
+    elif kind == "deleted":
+        lines.append("deleted file mode %s\n" % (om or "100644"))
+    else:
+        if kind == "renamed":
+            if before == after:
+                lines.append("similarity index 100%\n")
+            lines += ["rename from %s\n" % old, "rename to %s\n" % path]
+        if om and nm and om != nm:
+            lines += ["old mode %s\n" % om, "new mode %s\n" % nm]
+    if kind == "attr" or (kind == "renamed" and before == after):
+        return lines
+    src = "/dev/null" if kind == "added" else "a/" + old
+    dst = "/dev/null" if kind == "deleted" else "b/" + path
+    if sec.get("binary"):
+        lines.append("Binary files %s and %s differ\n" % (src, dst))
+    else:
+        lines += unified_body(before, after, src, dst)
+    return lines
+def patch_section(change, root, store_dir, baseline_dir, before_bytes, after_bytes, errors):
+    """Both sides of one verify change for the renderers; None (error recorded) when a needed side is unreadable."""
+    kind, path = change["kind"], change["path"]
+    before, after = change.get("before"), change.get("after")
+    sec = {"kind": kind, "path": path, "old_path": change.get("old_path"), "before": b"", "after": b"",
+           "old_mode": git_mode(before), "new_mode": git_mode(after), "binary": False}
+    if kind == "attr":
+        return sec
+    for side, entry, data in (("before", before, before_bytes), ("after", after, after_bytes)):
+        if not entry or entry.get("type") not in ("file", "symlink"):
+            continue
+        if entry["type"] == "symlink":
+            data = str(entry.get("target", "")).encode("utf-8", "surrogateescape")
+        elif data is None and side == "after":
+            try:
+                data = read_file(os.path.join(root, *path.split("/")))
+            except OSError as exc:
+                errors.append({"path": path, "error": str(exc)})
+        elif data is None:
+            data = baseline_bytes(entry, change.get("old_path") or path, store_dir, baseline_dir, errors)
+            if data is None:
+                errors.append({"path": path, "error": "--format needs before-content: %s is not in the store or baseline" % path})
+        if data is None:
+            return None
+        sec[side] = data
+    sec["binary"] = is_binary(sec["before"]) or is_binary(sec["after"])
+    return sec
+def unified_patch(sections):
+    return "".join("".join(git_section(s)) for s in sections).encode("utf-8", "surrogateescape")
+def fenced(lines, info="diff"):
+    """Fence = longest backtick run in the body + 1, at least 3, so diffs of markdown files render."""
+    body = "".join(lines)
+    fence = "`" * (max([len(r) for r in re.findall(r"`+", body)] + [2]) + 1)
+    return [fence + info, body[:-1] if body.endswith("\n") else body, fence]
+def md_bytes(book):
+    return ("\n".join(book) + "\n").encode("utf-8", "surrogateescape")
 RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 def parse_ranges(spec, flag="--within"):
     out = []
@@ -518,6 +636,38 @@ CHAR_RULES = (
 )
 def make_finding(path, rule, line, message):
     return {"path": path, "rule": rule, "severity": RULES[rule][0], "line": line, "message": message}
+def utf8_error(data):
+    """Byte offset of the first strict-UTF-8 decode error, or None when data decodes."""
+    try:
+        data.decode("utf-8")
+        return None
+    except UnicodeDecodeError as exc:
+        return exc.start
+_SCRIPT_MEMO = {}
+def script_of(ch):
+    """LATIN, CYRILLIC or GREEK for letters of those scripts (via unicodedata.name), else None."""
+    if ch not in _SCRIPT_MEMO:
+        name = unicodedata.name(ch, "")
+        _SCRIPT_MEMO[ch] = name.split(" ", 1)[0] if name.startswith(("LATIN ", "CYRILLIC ", "GREEK ")) else None
+    return _SCRIPT_MEMO[ch]
+def mixed_script_in(line):
+    """First maximal letter run mixing two of LATIN/CYRILLIC/GREEK: (token, scripts, odd_char) or None."""
+    if line.isascii():
+        return None
+    run, counts, first = [], {}, {}
+    for ch in line + " ":
+        if ch.isalpha() or unicodedata.category(ch).startswith("M"):
+            run.append(ch)
+            script = script_of(ch)
+            if script:
+                counts[script] = counts.get(script, 0) + 1
+                first.setdefault(script, ch)
+            continue
+        if len(counts) > 1:
+            odd = min(counts, key=counts.get)
+            return "".join(run), list(counts), first[odd]
+        run, counts, first = [], {}, {}
+    return None
 def placeholder_in(line, cls):
     if BRACKET_RE.search(line):
         return "bracketed elision token"
@@ -561,6 +711,7 @@ def scan_content(path, data, disabled):
         add("invalid-utf8", line_of_offset(data, exc.start), "invalid UTF-8 at byte offset %d" % exc.start)
     char_hits = {}
     conflict_open = False
+    scripts_on = "mixed-script" not in disabled
     for lineno, raw in enumerate(data.splitlines(True), 1):
         line = raw.decode("utf-8", "replace").rstrip("\r\n")
         if lineno == 1 and line.startswith("\ufeff"):
@@ -569,6 +720,7 @@ def scan_content(path, data, disabled):
             conflict_open = True
             add("conflict-marker", lineno, line[:60])
         elif line.startswith(">>>>>>>") and (len(line) == 7 or line[7] == " "):
+            conflict_open = True
             add("conflict-marker", lineno, line[:60])
         elif conflict_open and (line == "=======" or line.startswith("|||||||")):
             add("conflict-marker", lineno, line[:60])
@@ -585,13 +737,18 @@ def scan_content(path, data, disabled):
                     char_hits[rule] = [1, lineno, m.group(0), m.start() + 1]
                 else:
                     hit[0] += 1
+        mixed = mixed_script_in(line) if scripts_on else None
+        if mixed:
+            token, scripts, odd = mixed
+            add("mixed-script", lineno, "%s mixes %s (U+%04X %s)" % (
+                token[:40], "+".join(scripts), ord(odd), unicodedata.name(odd, "unnamed character")))
     for rule, (count, lineno, ch, col) in char_hits.items():
         name = unicodedata.name(ch, "unnamed character")
         more = "" if count == 1 else "; %d lines affected" % count
         add(rule, lineno, "%s (U+%04X) at column %d%s" % (name, ord(ch), col, more))
     return findings, None
 def scan_delta(path, before, after, disabled):
-    """Delta rules. Both sides required."""
+    """Delta rules. Both sides required; utf8-lost runs on raw bytes before the binary skip."""
     findings = []
     def add(rule, line, message):
         if rule not in disabled:
@@ -599,6 +756,13 @@ def scan_delta(path, before, after, disabled):
     lb, la = len(before), len(after)
     if lb >= SHRUNK_MIN_BEFORE and la < lb * SHRUNK_RATIO:
         add("shrunk", None, "shrank from %d to %d bytes (%d%% smaller)" % (lb, la, round(100 - 100.0 * la / lb)))
+    if ("utf8-lost" not in disabled and before and max(lb, la) <= SCAN_MAX_BYTES
+            and not is_binary(before) and utf8_error(before) is None):
+        bad = utf8_error(after)
+        if bad is not None:
+            how = ("UTF-16 byte order mark" if after[:2] in (b"\xff\xfe", b"\xfe\xff")
+                   else "invalid UTF-8 at byte offset %d" % bad)
+            add("utf8-lost", line_of_offset(after, bad), "was valid UTF-8; now %s (re-encoded?)" % how)
     if is_binary(before) or is_binary(after):
         return findings
     if has_bom(before) != has_bom(after):
@@ -863,8 +1027,8 @@ def run_snapshot(args, result):
     result.data.update({"manifest": None if out == "-" else to_posix(out), "store": store_rel,
                         "root": manifest["root"], "tree_hash": manifest["tree_hash"], "excludes": excludes})
     result.summary.update({"files": len(files), "bytes": total_bytes})
-    line = "snapshot %s  tree %s  -> %s" % (plural(len(files), "file"), short(manifest["tree_hash"]),
-                                           "stdout" if out == "-" else to_posix(out))
+    line = "snapshot %s, %s  tree %s  -> %s" % (plural(len(files), "file"), human_size(total_bytes),
+                                               short(manifest["tree_hash"]), "stdout" if out == "-" else to_posix(out))
     if store_rel:
         line += "  (store: %s)" % store_rel
     result.lines.append(line)
@@ -965,6 +1129,10 @@ def run_verify(args, result):
     violations = []
     all_findings = []
     disabled = policy.disabled
+    fmt = getattr(args, "format", "text")
+    if fmt != "text" and not store_dir and not args.baseline:
+        raise BytecheckError("--format %s needs before-content: snapshot with --store or pass --baseline DIR" % fmt)
+    sections = {}
     for change in changes:
         kind, path = change["kind"], change["path"]
         allowed, reason = evaluate_change(change, policy)
@@ -974,6 +1142,7 @@ def run_verify(args, result):
             violations.append({"kind": "change_not_allowed", "path": path, "change": kind, "reason": reason})
         findings = []
         after_bytes = None
+        before_bytes = None
         if kind in ("added", "modified") and change["after"]["type"] == "file":
             try:
                 after_bytes = read_file(os.path.join(root, *path.split("/")))
@@ -998,6 +1167,10 @@ def run_verify(args, result):
                     findings += content_findings
                     if note and note != "binary":
                         change["note"] = note
+        if fmt != "text":
+            section = patch_section(change, root, store_dir, args.baseline, before_bytes, after_bytes, result.errors)
+            if section is not None:
+                sections[path] = section
         if path in policy.within_ranges:
             ranges = policy.within_ranges[path]
             if kind in ("added", "deleted", "renamed"):
@@ -1030,14 +1203,33 @@ def run_verify(args, result):
     result.ok = not violations and not failing
     result.incomplete = bool(result.errors)
     counts = count_findings(all_findings)
+    here = to_posix(os.path.normpath(root))
+    baseline = {"store": None if not store_dir else to_posix(store_dir),
+                "dir": None if not args.baseline else to_posix(args.baseline),
+                "manifest": None, "created": None, "tool_version": None, "root": None}
+    if manifest is None:
+        baseline_line = "baseline dir %s  (no manifest)" % baseline["dir"]
+    else:
+        baseline.update({"manifest": None if args.manifest == "-" else to_posix(args.manifest),
+                         "created": manifest.get("created"), "tool_version": manifest.get("tool_version"),
+                         "root": manifest.get("root")})
+        baseline_line = "baseline %s  created %s  bytecheck %s  root %s" % (
+            baseline["manifest"] or "stdin", baseline["created"] or "?", baseline["tool_version"] or "?",
+            baseline["root"] or "?")
+        recorded_root = baseline["root"]
+        if isinstance(recorded_root, str) and recorded_root != here:
+            absolute = os.path.isabs(recorded_root)
+            if not absolute or os.path.normcase(os.path.abspath(recorded_root)) != os.path.normcase(os.path.abspath(root)):
+                diag("%s: note: manifest root %s, verifying root %s%s" % (TOOL_NAME, recorded_root, here, "" if absolute
+                     else " (recorded relative to the snapshot's working directory; may be the same directory)"))
+    result.lines.append(baseline_line)
     result.data.update({
-        "root": to_posix(os.path.normpath(root)),
+        "root": here,
         "tree_hash_before": recorded_before,
         "tree_hash_after": th_after,
         "policy": policy.to_json(),
         "excludes": excludes,
-        "baseline": {"store": None if not store_dir else to_posix(store_dir),
-                     "dir": None if not args.baseline else to_posix(args.baseline)},
+        "baseline": baseline,
         "changes": changes,
         "violations": violations,
         "findings": all_findings,
@@ -1051,6 +1243,7 @@ def run_verify(args, result):
         "untouched": recorded_before == th_after,
     })
     within_viol = {v["path"]: v["reason"] for v in violations if v["kind"] == "outside_within"}
+    change_lines, violation_lines = [], []
     for c in changes:
         label, extras = describe_change(c)
         if not c["allowed"]:
@@ -1059,12 +1252,16 @@ def run_verify(args, result):
             status = "VIOLATION " + within_viol[c["path"]]
         else:
             status = "allowed"
-        result.lines.append("%s %s%s %s" % (KIND_LETTER[c["kind"]], label, (" " + extras) if extras else "", status))
+        line = "%s %s%s %s" % (KIND_LETTER[c["kind"]], label, (" " + extras) if extras else "", status)
+        change_lines.append(line)
+        if status != "allowed":
+            violation_lines.append(line)
+    result.lines += change_lines
     for f in all_findings:
         result.lines.append(finding_line(f))
-    for v in violations:
-        if v["kind"] == "expect_missing":
-            result.lines.append("expected change missing: %s" % v["pattern"])
+    missing = ["expected change missing: %s" % v["pattern"] for v in violations if v["kind"] == "expect_missing"]
+    result.lines += missing
+    violation_lines += missing
     parts = [plural(len(changes), "change"), plural(len(violations), "violation")]
     if counts["error"]:
         parts.append(plural(counts["error"], "error finding"))
@@ -1075,6 +1272,22 @@ def run_verify(args, result):
     if result.incomplete:
         parts.append(plural(len(result.errors), "error") + " (see stderr)")
     result.lines.append("%s %s  %s -> %s" % (result.verdict(), ", ".join(parts), short(recorded_before), short(th_after)))
+    if fmt == "unified":
+        result.stdout_override = unified_patch([sections[c["path"]] for c in changes if c["path"] in sections])
+    elif fmt == "md":
+        book = ["# " + result.lines[-1], baseline_line, ""]
+        for c, line in zip(changes, change_lines):
+            sec = sections.get(c["path"])
+            if sec and sec["binary"]:
+                line += "  binary %d -> %d bytes" % (len(sec["before"]), len(sec["after"]))
+            book.append("## " + line)
+            if sec:
+                book += fenced(git_section(sec))
+            book += ["- " + finding_line(f) for f in c["findings"]] + [""]
+        book += ["## Violations"] + (violation_lines or ["(none)"]) + ["", "## Findings"]
+        book += [finding_line(f) for f in all_findings] or ["(none)"]
+        book += ["", result.lines[-1]]
+        result.stdout_override = md_bytes(book)
 def run_hash(args, result):
     if args.expect and len(args.paths) != 1:
         raise BytecheckError("--expect needs exactly one PATH")
@@ -1258,6 +1471,21 @@ def run_delta(args, result):
     if counts["info"]:
         parts.append(plural(counts["info"], "info"))
     result.lines.append("%s %s" % (result.verdict(), ", ".join(parts)))
+    fmt = getattr(args, "format", "text")
+    if fmt == "text":
+        return
+    patch = [] if identical else git_section({"kind": "modified", "path": data["new"]["path"], "old_path": data["old"]["path"],
+                                              "before": old, "after": new, "binary": binary})
+    if fmt == "unified":
+        result.stdout_override = "".join(patch).encode("utf-8", "surrogateescape")
+        return
+    book = ["# " + result.lines[-1], "## %s -> %s" % (data["old"]["path"], data["new"]["path"]), head, ""]
+    if patch:
+        book += fenced(patch) + [""]
+    book += ["- outside --within: " + v["reason"] for v in violations]
+    book += ["- " + finding_line(f) for f in findings]
+    book += ["", result.lines[-1]]
+    result.stdout_override = md_bytes(book)
 def run_scan(args, result):
     disabled = parse_disabled(args.disable)
     excluder = Excluder(list(DEFAULT_EXCLUDES) + list(args.exclude))
@@ -1303,6 +1531,193 @@ def run_scan(args, result):
     if not any(counts.values()):
         parts.append("0 findings")
     result.lines.append("%s %s" % (result.verdict(), ", ".join(parts)))
+# ----------------------------------------------------------------------------
+# blocks: CommonMark fenced code blocks, byte-oriented
+# ----------------------------------------------------------------------------
+HEADING_RE = re.compile(rb"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
+CLOSING_HASHES_RE = re.compile(rb"(?:^|[ \t]+)#+$")
+CODE_SPAN_RE = re.compile(rb"^`([^`]+)`$")
+def fence_opening(line):
+    """(char, length, indent, info) when LINE opens a fence: <=3 spaces, then >=3 backticks or tildes."""
+    text = line.rstrip(b"\r\n")
+    indent = len(text) - len(text.lstrip(b" "))
+    rest = text[indent:]
+    char = rest[:1]
+    if indent > 3 or char not in (b"`", b"~"):
+        return None
+    length = len(rest) - len(rest.lstrip(char))
+    info = rest[length:].strip()
+    if length < 3 or (char == b"`" and b"`" in info):
+        return None
+    return char, length, indent, info
+def fence_closes(line, char, length):
+    text = line.rstrip(b"\r\n")
+    indent = len(text) - len(text.lstrip(b" "))
+    rest = text[indent:]
+    run = len(rest) - len(rest.lstrip(char))
+    return indent <= 3 and run >= length and not rest[run:].strip()
+def heading_label(line):
+    """ATX heading text (closing #s dropped, one enclosing `code span` unwrapped); None when LINE is no heading."""
+    m = HEADING_RE.match(line.rstrip(b"\r\n"))
+    if m is None:
+        return None
+    text = CLOSING_HASHES_RE.sub(b"", m.group(2) or b"").strip()
+    span = CODE_SPAN_RE.match(text)
+    if span is not None:
+        text = span.group(1).strip()
+    return text.decode("utf-8", "surrogateescape")
+def strip_indent(line, indent):
+    k = 0
+    while k < indent and line[k:k + 1] == b" ":
+        k += 1
+    return line[k:]
+def parse_blocks(data):
+    """Fenced blocks of DATA: body bytes exact (EOLs kept) minus up to the opening indent per line; lines =
+    opening fence line .. closing fence line (EOF when unterminated); label = nearest ATX heading before the block."""
+    lines = data.splitlines(True)
+    blocks, label, i = [], None, 0
+    while i < len(lines):
+        opening = fence_opening(lines[i])
+        if opening is None:
+            heading = heading_label(lines[i])
+            if heading is not None:
+                label = heading or None
+            i += 1
+            continue
+        char, length, indent, info = opening
+        j = i + 1
+        while j < len(lines) and not fence_closes(lines[j], char, length):
+            j += 1
+        closed = j < len(lines)
+        blocks.append({
+            "index": len(blocks) + 1,
+            "lines": [i + 1, j + 1 if closed else len(lines)],
+            "info": info.decode("utf-8", "surrogateescape"),
+            "label": label,
+            "body": b"".join(strip_indent(ln, indent) for ln in lines[i + 1:j]),
+            "unterminated": not closed,
+        })
+        i = j + 1
+    return blocks
+def block_json(block):
+    return {"index": block["index"], "lines": list(block["lines"]), "bytes": len(block["body"]),
+            "sha256": hash_bytes(block["body"]), "info": block["info"], "label": block["label"],
+            "unterminated": block["unterminated"]}
+def block_row(block):
+    row = "%3d  %-9s %7d B  %s  %s  %s" % (block["index"], "%d-%d" % tuple(block["lines"]), len(block["body"]),
+                                          short(hash_bytes(block["body"])), block["info"] or "-", block["label"] or "-")
+    return row + ("  [unterminated]" if block["unterminated"] else "")
+def select_block(blocks, sel, result):
+    """The block SEL names: an index when SEL is all ASCII digits, else an exact label; otherwise list candidates and fail closed."""
+    if sel.isdigit() and sel.isascii():
+        if 1 <= int(sel) <= len(blocks):
+            return blocks[int(sel) - 1]
+        matches, why = [], "no block %s" % sel
+    else:
+        matches = [b for b in blocks if b["label"] == sel]
+        if len(matches) == 1:
+            return matches[0]
+        why = "label %r matches %d blocks; select by index" % (sel, len(matches)) if matches else "no block labelled %r" % sel
+    candidates = matches or blocks
+    result.data["candidates"] = [block_json(b) for b in candidates]
+    result.lines.extend(block_row(b) for b in candidates)
+    raise BytecheckError("%s (%s in %s)" % (why, plural(len(blocks), "block"), result.data.get("file", "-")))
+def label_path(label):
+    """LABEL as a root-relative path; None when empty, absolute, drive-qualified or escaping the root."""
+    if not label or os.path.isabs(label) or label[:1] in ("/", "\\") or label[1:2] == ":":
+        return None
+    norm = os.path.normpath(label)
+    return None if ".." in norm.replace("\\", "/").split("/") else norm
+def first_difference(a, b):
+    """Offset of the first differing byte, or None when A == B."""
+    if a == b:
+        return None
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+def run_blocks(args, result):
+    as_json = getattr(args, "json", False)
+    quiet = getattr(args, "quiet", False)
+    if args.to is not None and args.extract is None:
+        raise BytecheckError("--to needs --extract")
+    if args.extract is not None and args.same is not None:
+        raise BytecheckError("--extract and --same are mutually exclusive")
+    to_stdout = args.extract is not None and args.to in (None, "-")
+    if to_stdout and (as_json or quiet):
+        raise BytecheckError("blocks --extract puts the body bytes on stdout; with --json or --quiet give --to PATH")
+    if args.same is not None and not os.path.isdir(args.same):
+        raise BytecheckError("--same ROOT is not a directory: %s" % args.same)
+    if args.file == "-":
+        data = getattr(sys.stdin, "buffer", sys.stdin).read()
+    else:
+        try:
+            data = read_file(args.file)
+        except OSError as exc:
+            raise BytecheckError("cannot read %s: %s" % (args.file, exc))
+    result.data["file"] = args.file
+    blocks = parse_blocks(data)
+    result.summary.update({"blocks": len(blocks), "unterminated": sum(1 for b in blocks if b["unterminated"])})
+    if args.extract is not None:
+        block = select_block(blocks, args.extract, result)
+        body = block["body"]
+        result.data["block"] = block_json(block)
+        result.summary["bytes"] = len(body)
+        if block["unterminated"] and not quiet:
+            diag("%s: note: block %d is unterminated; its fence runs to end of file" % (TOOL_NAME, block["index"]))
+        line = "block %d (%s) %s" % (block["index"], block["label"] or "-", plural(len(body), "byte"))
+        if to_stdout:
+            result.stdout_override = body  # bytes: render() hands them to emit_bytes, or --report FILE receives them
+        else:
+            try:
+                write_atomic(args.to, body)
+            except OSError as exc:
+                raise BytecheckError("cannot write %s: %s" % (args.to, exc))
+            result.data["to"] = args.to
+            line += " -> %s" % args.to
+        result.lines.append(line)
+        return
+    if args.same is not None:
+        counts = {"identical": 0, "differ": 0, "no_file": 0}
+        entries = []
+        for block in blocks:
+            entry = block_json(block)
+            rel = label_path(block["label"])
+            full = os.path.join(args.same, rel) if rel is not None else None
+            if full is None or not os.path.isfile(full):
+                counts["no_file"] += 1
+                entry["status"], text = "no file", "no file" if block["label"] else "no file (no label)"
+            else:
+                try:
+                    off = first_difference(block["body"], read_file(full))
+                except OSError as exc:
+                    result.errors.append({"path": to_posix(rel), "error": str(exc)})
+                    entry["status"] = text = "unreadable"
+                else:
+                    if off is None:
+                        counts["identical"] += 1
+                        entry["status"] = text = "identical"
+                    else:
+                        counts["differ"] += 1
+                        entry["status"], entry["differs_at"], text = "differs", off, "differs at byte %d" % off
+            entry["path"] = to_posix(rel) if rel is not None else None
+            entries.append(entry)
+            result.lines.append("%3d  %s  %s" % (block["index"], block["label"] or "-", text))
+        result.data.update({"root": args.same, "blocks": entries})
+        result.summary.update(counts)
+        result.ok = counts["differ"] == 0
+        result.incomplete = bool(result.errors)
+        parts = [plural(len(blocks), "block"), "%d identical" % counts["identical"]]
+        if counts["differ"]:
+            parts.append("%d differ" % counts["differ"])
+        if counts["no_file"]:
+            parts.append("%d no file" % counts["no_file"])
+        result.lines.append("%s %s" % (result.verdict(), ", ".join(parts)))
+        return
+    result.data["blocks"] = [block_json(b) for b in blocks]
+    result.lines.extend(block_row(b) for b in blocks)
+    result.lines.append(plural(len(blocks), "block"))
 COMMANDS = {
     "snapshot": run_snapshot,
     "verify": run_verify,
@@ -1310,6 +1725,7 @@ COMMANDS = {
     "same": run_same,
     "delta": run_delta,
     "scan": run_scan,
+    "blocks": run_blocks,
 }
 # ----------------------------------------------------------------------------
 # CLI
@@ -1320,9 +1736,11 @@ exit codes:
   1  verdict fail (policy violation, error-severity finding, or warning under --strict)
   2  usage or environment error; whatever was computed is still printed with incomplete: true
 rules (error / warn / info):
-  error  conflict-marker placeholder nul-in-text bidi-control bom-changed eol-changed
-  warn   zero-width smart-quote nbsp mixed-eol shrunk trailing-newline-lost indent-flipped
+  error  conflict-marker placeholder nul-in-text bidi-control bom-changed eol-changed utf8-lost
+  warn   zero-width smart-quote nbsp mixed-eol mixed-script shrunk trailing-newline-lost indent-flipped
   info   bom no-trailing-newline invalid-utf8
+--report FILE (any command): the full output goes to FILE (UTF-8, written atomically); stdout keeps
+only the last text line, the verdict. Keep FILE under .bytecheck/ so it never dirties the next verify.
 glob dialect: patterns match the whole root-relative POSIX path; * stays within a path
 segment, ** crosses segments, ? is one character, a trailing / means the directory and
 everything below it. Default excludes: .git/ and .bytecheck/ (bytecheck's own artifacts).
@@ -1333,6 +1751,9 @@ def build_parser():
                         help="emit exactly one JSON document on stdout")
     common.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS,
                         help="print nothing; exit code only")
+    common.add_argument("--report", metavar="FILE", default=argparse.SUPPRESS,
+                        help="write the full output (text, or the JSON document with --json) to FILE, atomically, "
+                             "as UTF-8; stdout then carries only the last text line (recommended: under .bytecheck/)")
     parser = argparse.ArgumentParser(
         prog=TOOL_NAME, parents=[common],
         description="Byte-exact verification of what an agent changed. "
@@ -1383,6 +1804,9 @@ def build_parser():
     vp.add_argument("--strict", action="store_true", help="warnings fail the run")
     vp.add_argument("--exclude", action="append", default=[], metavar="GLOB",
                     help="exclude more paths on top of the manifest's excludes (repeatable)")
+    vp.add_argument("--format", choices=("text", "unified", "md"), default="text",
+                    help="text (default); unified: a git-style patch and nothing else; md: a markdown review book "
+                         "ending with the verdict line. Both need --store-time content or --baseline; not with --json")
     hp = sub.add_parser("hash", parents=[common], help="sha256 and size of files, stdin, or a tree",
                         description="SHA-256 and size per file; - reads stdin; a directory yields its tree_hash "
                                     "(same definition and default excludes as the manifest). "
@@ -1411,6 +1835,9 @@ def build_parser():
     dp.add_argument("--disable", action="append", default=[], metavar="RULE",
                     help="disable a content rule (repeatable)")
     dp.add_argument("--strict", action="store_true", help="warnings fail the run")
+    dp.add_argument("--format", choices=("text", "unified", "md"), default="text",
+                    help="text (default); unified: a git-style patch OLD -> NEW and nothing else; "
+                         "md: a markdown review book ending with the verdict line (not with --json)")
     cp = sub.add_parser("scan", parents=[common], help="content-hygiene rules on files or trees, no baseline needed",
                         description="Absolute content rules (conflict markers, placeholders, NUL, bidi controls, "
                                     "zero-width, smart quotes, NBSP, mixed EOL, BOM, trailing newline, UTF-8) "
@@ -1421,32 +1848,79 @@ def build_parser():
     cp.add_argument("--strict", action="store_true", help="warnings fail the run")
     cp.add_argument("--exclude", action="append", default=[], metavar="GLOB",
                     help="exclude matching paths when scanning a tree (repeatable)")
+    bp = sub.add_parser("blocks", parents=[common], help="list, extract or check the fenced code blocks of a markdown file",
+                        description="CommonMark fenced code blocks of FILE (- for stdin): index, line span, bytes, sha256, "
+                                    "info string and label (the nearest preceding ATX heading; one enclosing `code span` "
+                                    "is unwrapped). --extract copies one block's body bytes exactly, EOLs included; "
+                                    "--same compares every block with the file its label names under ROOT. Listing never "
+                                    "fails; --same fails on a difference (exit 1), not on a missing file.")
+    bp.add_argument("file", metavar="FILE", help="markdown or text file, or - for stdin (put FILE before --same)")
+    bp.add_argument("--extract", metavar="SEL",
+                    help="block to copy: its index (all digits) or its exact label; unknown or ambiguous SEL exits 2 "
+                         "listing the candidates")
+    bp.add_argument("--to", metavar="PATH",
+                    help="write the extracted bytes to PATH (atomically; parents created); - or omitted: raw bytes on "
+                         "stdout (then --json and --quiet are refused, and --report FILE receives the bytes)")
+    bp.add_argument("--same", nargs="?", const=".", default=None, metavar="ROOT",
+                    help="compare each block with ROOT/<label> (default ROOT: .): identical, differs at byte N, or no file")
     return parser
 
 
-def report(result, as_json, quiet):
+def render(result, as_json):
+    """Everything that would reach stdout in the chosen mode; with --report it goes to FILE instead."""
+    if result.stdout_override is not None:
+        return result.stdout_override
+    if as_json:
+        return dumps(result.to_json())
+    if result.lines:
+        return "\n".join(result.lines) + "\n"
+    return ""
+def emit_bytes(data):
+    """Byte-faithful stdout for --format output: no re-encoding, no newline translation."""
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        emit(data.decode("utf-8", "surrogateescape"))
+        return
+    sys.stdout.flush()
+    stream.write(data)
+    stream.flush()
+def report(result, as_json, quiet, report_path=None):
+    output = render(result, as_json)  # str, or bytes when a --format renderer produced the output
+    if report_path is not None:
+        try:
+            write_atomic(report_path, output if isinstance(output, bytes) else to_bytes(output))
+        except OSError as exc:
+            result.incomplete = True
+            result.errors.append({"path": report_path, "error": "cannot write report: %s" % exc})
     if quiet:
         return
     for err in result.errors:
         where = ("%s: " % err["path"]) if err.get("path") else ""
         diag("%s: error: %s%s" % (TOOL_NAME, where, err["error"]))
-    if result.stdout_override is not None:
-        emit(result.stdout_override)
-    elif as_json:
-        emit(dumps(result.to_json()))
+    if report_path is None:
+        if isinstance(output, bytes):
+            emit_bytes(output)
+        else:
+            emit(output)
     elif result.lines:
-        emit("\n".join(result.lines) + "\n")
-
-
+        emit(result.lines[-1] + "\n")
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     as_json = getattr(args, "json", False)
     quiet = getattr(args, "quiet", False)
+    report_path = getattr(args, "report", None)
     result = Result(args.command)
     try:
-        if args.command == "snapshot" and args.output == "-" and quiet:
-            raise BytecheckError("snapshot -o - and --quiet are mutually exclusive")
+        if args.command == "snapshot" and args.output == "-":
+            if quiet:
+                raise BytecheckError("snapshot -o - and --quiet are mutually exclusive")
+            if report_path is not None:
+                report_path = None  # usage error: FILE must not be created
+                raise BytecheckError("snapshot -o - and --report are mutually exclusive")
+        if as_json and getattr(args, "format", "text") != "text":
+            report_path = None  # usage error: FILE must not be created
+            raise BytecheckError("--format %s and --json are mutually exclusive" % args.format)
         COMMANDS[args.command](args, result)
     except BytecheckError as exc:
         result.incomplete = True
@@ -1458,7 +1932,7 @@ def main(argv=None):
         result.incomplete = True
         result.errors.append({"path": None, "error": "internal error: %s: %s" % (type(exc).__name__, exc)})
     try:
-        report(result, as_json, quiet)
+        report(result, as_json, quiet, report_path)
     except BrokenPipeError:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, sys.stdout.fileno())
