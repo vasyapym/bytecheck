@@ -10,6 +10,10 @@ schema changes; `verify` refuses manifests newer than it understands.
   a `.sha256` sidecar; `SKILL.md` documents install and the harvest protocol.
   `bytecheck.py` is unchanged.
 
+## 0.3.0 - 2026-11-13
+
+- Commands: `snapshot --plan` (measure-only walk: files and bytes per top-level directory, projected store size, nothing written) and `cut` (byte-preserving slice between two whole-line markers; `--body` trims blank edges and unwraps a lone fenced block).
+
 ## 0.1.0 - 2026-10-23
 
 First release.
